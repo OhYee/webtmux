@@ -1,0 +1,23 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+*.exe
+*.test
+*.out
+
+# Local build (not cross-compiled)
+/webtmux
+
+# Generated release artifacts
+/builds/
+
+# Frontend dependencies
+node_modules/

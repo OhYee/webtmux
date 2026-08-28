@@ -1,0 +1,168 @@
+<!doctype html>
+<html data-view="board">
+<head>
+  <title>{{ .title }}</title>
+  <link rel="manifest" href="manifest.json" crossorigin="use-credentials">
+  <link rel="icon" href="favicon.ico">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+
+  <!-- Vendored, not from a CDN: this runs on a phone on a LAN or tailnet that
+       may have no route to the internet at all. -->
+  <link rel="stylesheet" href="./css/xterm.css" />
+
+  <style>
+    /*
+     * A night-watch console. The background is warm near-black rather than the
+     * usual blue-black: a blue cast shifts every ANSI colour drawn on top of
+     * it, and agent output is mostly colour.
+     *
+     * Chrome stays neutral so the ANSI colours in pane output remain the focus.
+     */
+    :root {
+      --visual-viewport-height: 100dvh;
+      --bg: #0c0b0a;
+      --bg-lift: #131211;
+      --card: #161513;
+      --card-hi: #1e1c1a;
+      --line: #272421;
+      --line-soft: #1c1a18;
+
+      --text: #edeae5;
+      --muted: #8b857c;
+      --faint: #5d574e;
+
+      --signal: #ffb03a;
+      --alert: #ff5a45;
+
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, system-ui, "Helvetica Neue", sans-serif;
+
+      /* Structural labels: small, wide, uppercase — instrument legends. */
+      --legend-size: 10px;
+      --legend-track: 0.09em;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    #shell {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    #app {
+      display: flex;
+      flex: 1;
+      min-height: 0;
+    }
+
+    #terminal-container {
+      flex: 1;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    #terminal {
+      height: 100%;
+      width: 100%;
+    }
+
+    .xterm {
+      height: 100%;
+      padding: 8px 10px 4px;
+    }
+
+    #board, #reader {
+      display: none;
+    }
+
+    /* The key bar belongs to the terminal: the board is not typed into, and
+       the reader has an input box of its own. */
+    #keybar {
+      display: none;
+    }
+
+    @media (max-width: 1023px) {
+      body,
+      #shell,
+      #board {
+        height: var(--visual-viewport-height);
+        max-height: var(--visual-viewport-height);
+      }
+
+      html[data-view="terminal"] #keybar[open] { display: block; }
+    }
+
+    /*
+     * The detail view is either the terminal or the reader, on both sizes: the
+     * reader reflows output to the screen, the terminal is there when something
+     * needs a real TTY. Only the surroundings differ.
+     */
+    html[data-view="reader"] #reader { display: flex; }
+    html[data-view="reader"] #terminal-container { display: none; }
+
+    /*
+     * Touch has to choose everything: the board is the front door and takes the
+     * whole viewport, and the reader brings its own header so the terminal bar
+     * steps aside.
+     */
+    @media (max-width: 1023px) {
+      html[data-view="board"] #board { display: flex; }
+      html[data-view="board"] #shell { display: none; }
+      html[data-view="reader"] webtmux-terminal-bar { display: none; }
+    }
+
+    /*
+     * Desktop does not have to choose between watching and working. The rail
+     * keeps the board permanently beside whichever detail view is showing, and
+     * owns the switch between them.
+     */
+    @media (min-width: 1024px) {
+      webtmux-terminal-bar { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+
+</head>
+
+<body>
+  <!-- Front door on touch screens -->
+  <webtmux-watch-board id="board"></webtmux-watch-board>
+
+  <div id="shell">
+    <webtmux-terminal-bar></webtmux-terminal-bar>
+    <div id="app">
+      <!-- The rail is the index, the detail view is the terminal or the reader. -->
+      <webtmux-sidebar id="sidebar"></webtmux-sidebar>
+      <div id="terminal-container">
+        <div id="terminal"></div>
+      </div>
+      <webtmux-reader-view id="reader"></webtmux-reader-view>
+    </div>
+
+    <!-- Key bar: the always-visible row, and the drawer it expands into -->
+    <webtmux-key-bar id="keybar"></webtmux-key-bar>
+  </div>
+
+  <script src="./auth_token.js"></script>
+  <script src="./config.js"></script>
+  <script type="module" src="./js/bundle.js"></script>
+</body>
+</html>

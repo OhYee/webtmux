@@ -1,0 +1,6 @@
+# Generated and binary assets should not be treated as hand-written text.
+bindata/static/js/bundle.js linguist-generated=true -diff
+*.ai binary
+*.gif binary
+*.ico binary
+*.png binary

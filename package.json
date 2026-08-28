@@ -1,0 +1,17 @@
+{
+  "name": "webtmux-frontend",
+  "private": true,
+  "description": "Bundles the browser assets into bindata so the UI works with no network.",
+  "scripts": {
+    "bundle": "esbuild resources/js/webtmux.js --bundle --format=esm --minify --target=safari15 --outfile=bindata/static/js/bundle.js"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.10.0",
+    "@xterm/addon-webgl": "0.18.0",
+    "@xterm/xterm": "5.5.0",
+    "lit": "^3.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
