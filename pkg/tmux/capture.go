@@ -70,7 +70,7 @@ func (c *Controller) Capture(paneID string, lines int, known string) (*Capture, 
 		lines, capped = maxCaptureLines, true
 	}
 	key := paneID + ":" + strconv.Itoa(lines)
-	return c.watch.captureSnapshot(key, known, func() (*Capture, error) {
+	return c.watch.captureSnapshot(paneID, key, known, func() (*Capture, error) {
 		return c.captureFresh(paneID, lines, known, capped)
 	})
 }

@@ -31,6 +31,11 @@ class WebtmuxKeyBar extends LitElement {
       display: block;
       height: 0;
       position: relative;
+      /* xterm's link layer is a full-size canvas. Without an explicit
+         stacking level it is painted above this zero-height flex item, so the
+         drawer remains visible but every tap is intercepted by the terminal. */
+      z-index: 100;
+      pointer-events: none;
       flex-shrink: 0;
     }
 
@@ -51,6 +56,8 @@ class WebtmuxKeyBar extends LitElement {
       left: 0;
       right: 0;
       bottom: 0;
+      z-index: 1;
+      pointer-events: auto;
       background: var(--bg-lift);
       border-top: 1px solid var(--line);
       box-shadow: 0 -12px 24px rgba(0, 0, 0, 0.45);

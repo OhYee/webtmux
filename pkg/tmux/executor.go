@@ -3,7 +3,9 @@ package tmux
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,9 +52,13 @@ func (e *Executor) Run(args ...string) (string, error) {
 		return "", err
 	}
 	if ctl != nil {
+		started := time.Now()
 		out, err := ctl.Run(args...)
 		if err != nil {
+			slog.Warn("tmux control command failed; invalidating connection", "command", commandName(args), "session", e.session, "socket", e.socket, "duration", time.Since(started).Round(time.Millisecond), "error", err)
 			e.invalidate(ctl)
+		} else {
+			slog.Debug("tmux command completed", "transport", "control", "command", commandName(args), "session", e.session, "duration", time.Since(started).Round(time.Millisecond))
 		}
 		return out, err
 	}
@@ -60,13 +66,18 @@ func (e *Executor) Run(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), fallbackCommandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "tmux", append(socketArgsFor(e.socket), args...)...)
-	output, err := cmd.Output()
+	started := time.Now()
+	output, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
+		slog.Error("tmux command timed out", "transport", "process", "command", commandName(args), "session", e.session, "socket", e.socket, "duration", time.Since(started).Round(time.Millisecond))
 		return "", fmt.Errorf("tmux command timed out: %w", ctx.Err())
 	}
 	if err != nil {
-		return "", fmt.Errorf("tmux command failed: %w", err)
+		stderr := truncate(string(output), 2048)
+		slog.Warn("tmux command failed", "transport", "process", "command", commandName(args), "session", e.session, "socket", e.socket, "duration", time.Since(started).Round(time.Millisecond), "error", err, "output", stderr)
+		return "", fmt.Errorf("tmux command failed: %w: %s", err, stderr)
 	}
+	slog.Debug("tmux command completed", "transport", "process", "command", commandName(args), "session", e.session, "duration", time.Since(started).Round(time.Millisecond))
 	return string(output), nil
 }
 
@@ -109,6 +120,7 @@ func (e *Executor) control() *Control {
 			}
 		}
 		e.nextDial = time.Now().Add(e.dialDelay)
+		slog.Warn("tmux control connection failed; using process fallback", "session", e.session, "socket", e.socket, "retry_in", e.dialDelay, "error", err)
 		e.mu.Unlock()
 		return nil
 	}
@@ -124,10 +136,26 @@ func (e *Executor) control() *Control {
 	e.dialDelay = 0
 	onControl := e.onControl
 	e.mu.Unlock()
+	slog.Info("tmux control connection established", "session", e.session, "socket", e.socket)
 	if onControl != nil {
 		onControl(ctl)
 	}
 	return ctl
+}
+
+func commandName(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
+}
+
+func truncate(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
 }
 
 func (e *Executor) invalidate(ctl *Control) {

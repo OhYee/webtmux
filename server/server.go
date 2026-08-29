@@ -210,6 +210,9 @@ func (server *Server) Run(ctx context.Context, options ...RunOption) error {
 		path = path + "/"
 	}
 	handlers := server.setupHandlers(cctx, cancel, path, counter)
+	if server.tmuxSession != "" {
+		go server.runLayoutSweeper(cctx)
+	}
 	srv, err := server.setupHTTPServer(handlers)
 	if err != nil {
 		return errors.Wrapf(err, "failed to setup an HTTP server")
@@ -287,6 +290,23 @@ func (server *Server) Run(ctx context.Context, options ...RunOption) error {
 	counter.wait()
 
 	return err
+}
+
+// runLayoutSweeper provides one aligned fallback wake-up for the whole
+// process. Layout notifications normally update clients immediately; this
+// catches notifications that tmux control mode cannot see without creating a
+// separate ticker (and tmux query schedule) for every browser connection.
+func (server *Server) runLayoutSweeper(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			server.layoutDirty.broadcast()
+		}
+	}
 }
 
 func (server *Server) setupHandlers(ctx context.Context, cancel context.CancelFunc, pathPrefix string, counter *counter) http.Handler {

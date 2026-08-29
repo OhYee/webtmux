@@ -23,7 +23,8 @@ func GenerateFlags(options ...interface{}) (flags []cli.Flag, mappings map[strin
 			if flagName == "" {
 				continue
 			}
-			envName := "GOTTY_" + strings.ToUpper(strings.Join(strings.Split(flagName, "-"), "_"))
+			envSuffix := strings.ToUpper(strings.Join(strings.Split(flagName, "-"), "_"))
+			envNames := []string{"WEBTMUX_" + envSuffix, "GOTTY_" + envSuffix}
 			mappings[flagName] = field.Name()
 
 			flagShortName := field.Tag("flagSName")
@@ -40,14 +41,14 @@ func GenerateFlags(options ...interface{}) (flags []cli.Flag, mappings map[strin
 					Name:    flagName,
 					Value:   field.Value().(string),
 					Usage:   flagDescription,
-					EnvVars: []string{envName},
+					EnvVars: envNames,
 					Aliases: aliases,
 				})
 			case reflect.Bool:
 				flags = append(flags, &cli.BoolFlag{
 					Name:        flagName,
 					Usage:       flagDescription,
-					EnvVars:     []string{envName},
+					EnvVars:     envNames,
 					Aliases:     aliases,
 					DefaultText: field.Tag("default"),
 				})
@@ -56,7 +57,7 @@ func GenerateFlags(options ...interface{}) (flags []cli.Flag, mappings map[strin
 					Name:    flagName,
 					Value:   field.Value().(int),
 					Usage:   flagDescription,
-					EnvVars: []string{envName},
+					EnvVars: envNames,
 					Aliases: aliases,
 				})
 			}

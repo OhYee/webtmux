@@ -3,13 +3,16 @@ package server
 import (
 	"encoding/base64"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var requestSequence atomic.Uint64
 
 // rateLimiter provides brute force protection for authentication
 type rateLimiter struct {
@@ -167,7 +170,7 @@ func (rl *rateLimiter) recordFailure(ip string) {
 		}
 	}
 
-	log.Printf("Auth failure from %s (IP attempts: %d, global failures: %d)", ip, info.failCount, failureCount)
+	slog.Warn("authentication failed", "remote_ip", ip, "ip_attempts", info.failCount, "global_failures", failureCount)
 }
 
 // recordSuccess resets the per-IP counter on successful login
@@ -185,9 +188,12 @@ var authRateLimiter = newRateLimiter()
 
 func (server *Server) wrapLogger(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := fmt.Sprintf("r-%d", requestSequence.Add(1))
+		w.Header().Set("X-Request-ID", requestID)
 		rw := &logResponseWriter{w, 200}
+		started := time.Now()
 		handler.ServeHTTP(rw, r)
-		log.Printf("%s %d %s %s", r.RemoteAddr, rw.status, r.Method, r.URL.Path)
+		slog.Info("http request", "request_id", requestID, "remote", r.RemoteAddr, "status", rw.status, "method", r.Method, "path", r.URL.Path, "duration", time.Since(started).Round(time.Millisecond))
 	})
 }
 
@@ -211,10 +217,10 @@ func (server *Server) wrapBasicAuth(handler http.Handler, credential string) htt
 		if locked, remaining, lockType := authRateLimiter.checkLocked(ip); locked {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(remaining.Seconds())+1))
 			if lockType == "global" {
-				log.Printf("Global lockout active, rejected %s (retry in %v)", ip, remaining)
+				slog.Warn("global authentication lockout rejected request", "remote_ip", ip, "retry_in", remaining)
 				http.Error(w, "Too many failed login attempts. Service temporarily locked.", http.StatusTooManyRequests)
 			} else {
-				log.Printf("IP %s locked out (retry in %v)", ip, remaining)
+				slog.Warn("IP authentication lockout rejected request", "remote_ip", ip, "retry_in", remaining)
 				http.Error(w, "Too many failed login attempts. Try again later.", http.StatusTooManyRequests)
 			}
 			return
@@ -230,6 +236,7 @@ func (server *Server) wrapBasicAuth(handler http.Handler, credential string) htt
 
 		payload, err := base64.StdEncoding.DecodeString(token[1])
 		if err != nil {
+			slog.Warn("malformed basic authentication header", "remote", r.RemoteAddr, "error", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
@@ -243,7 +250,7 @@ func (server *Server) wrapBasicAuth(handler http.Handler, credential string) htt
 
 		// Success - reset IP counter
 		authRateLimiter.recordSuccess(ip)
-		log.Printf("Basic Authentication Succeeded: %s", r.RemoteAddr)
+		slog.Debug("basic authentication succeeded", "remote", r.RemoteAddr)
 		handler.ServeHTTP(w, r)
 	})
 }

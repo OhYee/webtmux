@@ -8,6 +8,9 @@ BUILD_OPTIONS = -ldflags "-s -w -X main.Version=$(VERSION) -X main.GitCommit=$(G
 
 OUTPUT_DIR = ./builds
 BINARY_NAME = webtmux
+TMUX_SESSION ?= webtmux
+TMUX_WINDOW ?= webtmux
+WEBTMUX_FLAGS ?= -w
 
 # Platforms to build for (PTY not supported on Windows)
 PLATFORMS = \
@@ -20,7 +23,7 @@ PLATFORMS = \
 
 export CGO_ENABLED=0
 
-.PHONY: all deps bundle sync-assets check-generated build install test clean cross-compile release dev help
+.PHONY: all deps bundle sync-assets check-generated build install test clean cross-compile release dev start logs help
 
 # Default target
 all: build
@@ -112,6 +115,22 @@ release: cross-compile
 # Development build with fresh bundled assets
 dev: build
 
+# Recreate a predictable tmux home for webtmux. The server runs in the
+# webtmux:webtmux pane and browser connections attach back to that same session.
+start: build
+	@tmux kill-session -t "$(TMUX_SESSION)" 2>/dev/null || true
+	@tmux new-session -d -s "$(TMUX_SESSION)" -n "$(TMUX_WINDOW)"
+	@tmux set-option -w -t "$(TMUX_SESSION):$(TMUX_WINDOW)" remain-on-exit on
+	@tmux respawn-pane -k -t "$(TMUX_SESSION):$(TMUX_WINDOW)" \
+		env -u TMUX "$(CURDIR)/$(BINARY_NAME)" $(WEBTMUX_FLAGS) \
+		tmux attach-session -t "$(TMUX_SESSION)"
+	@echo "Started $(BINARY_NAME) in tmux session $(TMUX_SESSION), window $(TMUX_WINDOW)."
+	@echo "View logs: make logs"
+	@echo "Open pane: tmux attach-session -t $(TMUX_SESSION)"
+
+logs:
+	@tmux capture-pane -p -S - -t "$(TMUX_SESSION):$(TMUX_WINDOW)"
+
 help:
 	@echo "WebTmux Makefile"
 	@echo ""
@@ -124,4 +143,6 @@ help:
 	@echo "  make cross-compile Build for all platforms"
 	@echo "  make release      Create release archives"
 	@echo "  make dev          Build with fresh assets"
+	@echo "  make start        Recreate webtmux:webtmux and serve that tmux session"
+	@echo "  make logs         Print the webtmux pane log, including startup failures"
 	@echo "  make help         Show this help"

@@ -36,7 +36,8 @@ type WebTTY struct {
 	resizePermit      func() error
 
 	// Tmux controller for tmux-specific operations
-	tmuxCtrl TmuxController
+	tmuxCtrl     TmuxController
+	tmuxMessages chan []byte
 }
 
 // New creates a new instance of WebTTY.
@@ -55,8 +56,9 @@ func New(masterConn Master, slave Slave, options ...Option) (*WebTTY, error) {
 		// Chunks leaving the PTY become one WebSocket frame each after base64,
 		// so a kilobyte buffer turned a fast-scrolling pane into over a thousand
 		// frames a second, each with its own write lock and a decode on the phone.
-		bufferSize: 32 * 1024,
-		decoder:    &NullCodec{},
+		bufferSize:   32 * 1024,
+		decoder:      &NullCodec{},
+		tmuxMessages: make(chan []byte, 16),
 	}
 
 	for _, option := range options {
@@ -78,7 +80,7 @@ func (wt *WebTTY) Run(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to send initializing message")
 	}
 
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 
 	go func() {
 		errs <- func() error {
@@ -100,6 +102,24 @@ func (wt *WebTTY) Run(ctx context.Context) error {
 				}
 			}
 		}()
+	}()
+
+	// tmux metadata and capture operations can take long enough to make typed
+	// input feel lost. Keep them ordered, but execute them outside the WebSocket
+	// reader so Input, Ping, and Resize messages continue to flow.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				errs <- ctx.Err()
+				return
+			case data := <-wt.tmuxMessages:
+				if err := wt.handleTmuxMessage(data[0], data[1:]); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}
 	}()
 
 	go func() {
@@ -166,8 +186,10 @@ func (wt *WebTTY) sendInitializeMessage() error {
 }
 
 func (wt *WebTTY) handleSlaveReadEvent(data []byte) error {
-	safeMessage := base64.StdEncoding.EncodeToString(data)
-	err := wt.masterWrite(append([]byte{Output}, []byte(safeMessage)...))
+	// Server-to-browser terminal output uses a binary WebSocket frame. Base64
+	// added 33% on the wire and forced full-buffer encode/decode copies on both
+	// sides for the hottest path in the application.
+	err := wt.masterWrite(append([]byte{Output}, data...))
 	if err != nil {
 		return errors.Wrapf(err, "failed to send message to master")
 	}
@@ -281,7 +303,13 @@ func (wt *WebTTY) handleMasterReadEvent(data []byte) error {
 	default:
 		// Check if it's a tmux message
 		if isTmuxMessage(data[0]) {
-			return wt.handleTmuxMessage(data[0], data[1:])
+			message := append([]byte(nil), data...)
+			select {
+			case wt.tmuxMessages <- message:
+				return nil
+			default:
+				return errors.New("tmux request queue is full")
+			}
 		}
 		return errors.Errorf("unknown message type `%c`", data[0])
 	}

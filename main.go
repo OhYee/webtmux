@@ -5,8 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,15 +15,24 @@ import (
 
 	"webtmux/backend/localcommand"
 	"webtmux/pkg/homedir"
+	"webtmux/pkg/logging"
 	"webtmux/server"
 	"webtmux/utils"
 )
 
 func main() {
+	environment, err := loadEnvironment(os.Args, os.LookupEnv, os.Setenv)
+	if err != nil {
+		exit(fmt.Errorf("failed to load environment file: %w", err), 2)
+	}
+	if err := prepareCredential(os.LookupEnv, os.Setenv); err != nil {
+		exit(fmt.Errorf("failed to prepare authentication environment: %w", err), 2)
+	}
+	authUsername := configuredUsername(os.LookupEnv)
+	language := detectLanguage(os.Args, os.Getenv)
 	app := cli.NewApp()
 	app.Name = "webtmux"
 	app.Version = Version
-	app.Usage = "Web terminal for tmux with visual pane layout"
 	app.HideHelpCommand = true
 	appOptions := &server.Options{}
 
@@ -49,7 +57,20 @@ func main() {
 			Usage:   "Config file path",
 			EnvVars: []string{"GOTTY_CONFIG"},
 		},
+		&cli.StringFlag{
+			Name:    "lang",
+			Value:   language,
+			Usage:   "Help language: auto, en, or zh-CN",
+			EnvVars: []string{"WEBTMUX_LANG"},
+		},
+		&cli.StringFlag{
+			Name:    "env-file",
+			Value:   environment.path,
+			Usage:   "Environment file path",
+			EnvVars: []string{"WEBTMUX_ENV_FILE"},
+		},
 	)
+	configureHelp(app, language)
 
 	app.Action = func(c *cli.Context) error {
 		if c.NArg() == 0 {
@@ -67,41 +88,41 @@ func main() {
 		}
 
 		utils.ApplyFlags(cliFlags, flagMappings, c, appOptions, backendOptions)
+		if c.IsSet("tls-ca-crt") {
+			appOptions.EnableTLSClientAuth = true
+		}
+		if err := appOptions.Validate(); err != nil {
+			exit(err, 6)
+		}
 
-		if appOptions.Quiet {
-			log.SetFlags(0)
-			log.SetOutput(io.Discard)
+		logging.Configure(appOptions.LogLevel, appOptions.LogFormat, appOptions.Quiet)
+		if environment.loaded {
+			slog.Info("environment file loaded", "path", environment.path)
+			if environment.permission&0o077 != 0 {
+				slog.Warn("environment file is readable or writable by other users", "path", environment.path, "permission", fmt.Sprintf("%04o", environment.permission))
+			}
 		}
 
 		// Handle authentication
 		if appOptions.NoAuth {
 			appOptions.EnableBasicAuth = false
-			log.Printf("WARNING: Authentication disabled. Terminal is publicly accessible!")
+			slog.Warn("authentication disabled; terminal is publicly accessible")
 		} else if appOptions.Credential != "" {
 			appOptions.EnableBasicAuth = true
 		} else {
 			// Generate random credentials
 			appOptions.EnableBasicAuth = true
-			appOptions.Credential = "admin:" + generateRandomPassword(32)
+			appOptions.Credential = authUsername + ":" + generateRandomPassword(32)
 			fmt.Printf("\n")
 			fmt.Printf("========================================\n")
 			fmt.Printf("  Authentication Required (default)\n")
-			fmt.Printf("  Username: admin\n")
+			fmt.Printf("  Username: %s\n", authUsername)
 			fmt.Printf("  Password: %s\n", strings.Split(appOptions.Credential, ":")[1])
 			fmt.Printf("========================================\n")
 			fmt.Printf("  Use -c user:pass to set custom credentials\n")
 			fmt.Printf("  Use --no-auth to disable (not recommended)\n")
 			fmt.Printf("========================================\n")
 			fmt.Printf("\n")
-		}
-
-		if c.IsSet("tls-ca-crt") {
-			appOptions.EnableTLSClientAuth = true
-		}
-
-		err = appOptions.Validate()
-		if err != nil {
-			exit(err, 6)
 		}
 
 		args := c.Args()
@@ -125,7 +146,11 @@ func main() {
 		ctx, cancel := context.WithCancel(context.Background())
 		gCtx, gCancel := context.WithCancel(context.Background())
 
-		log.Printf("WebTmux is starting with command: %s", strings.Join(args.Slice(), " "))
+		slog.Info("webtmux starting", "version", Version, "command", args.First(), "arg_count", len(args.Tail()),
+			"address", appOptions.Address, "port", appOptions.Port, "path", appOptions.Path,
+			"auth", appOptions.EnableBasicAuth, "tls", appOptions.EnableTLS, "tmux_session", tmuxSessionForLog(args.Slice()),
+			"max_connections", appOptions.MaxConnection, "reader_history", appOptions.ReaderHistory, "max_tmux_rate", appOptions.MaxTmuxRate)
+		slog.Debug("child command arguments", "command", args.First(), "args", args.Tail())
 
 		errs := make(chan error, 1)
 		go func() {
@@ -151,6 +176,15 @@ func main() {
 	app.Run(os.Args)
 }
 
+func tmuxSessionForLog(args []string) string {
+	for i, arg := range args {
+		if (arg == "-s" || arg == "-t") && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 func exit(err error, code int) {
 	if err != nil {
 		fmt.Println(err)
@@ -171,15 +205,16 @@ func waitSignals(errs chan error, cancel context.CancelFunc, gracefullCancel con
 		return err
 
 	case s := <-sigChan:
+		slog.Info("shutdown signal received", "signal", s.String())
 		switch s {
 		case syscall.SIGINT:
 			gracefullCancel()
-			fmt.Println("C-C to force close")
+			slog.Info("graceful shutdown started; press Ctrl-C again to force close")
 			select {
 			case err := <-errs:
 				return err
 			case <-sigChan:
-				fmt.Println("Force closing...")
+				slog.Warn("forcing shutdown after second interrupt")
 				cancel()
 				return <-errs
 			}

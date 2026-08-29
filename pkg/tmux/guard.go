@@ -2,7 +2,7 @@ package tmux
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -144,9 +144,9 @@ func (g *Guard) Record() error {
 	g.closers = make(map[uint64]func())
 	g.mu.Unlock()
 
-	log.Printf("SAFETY: %s", reason)
-	log.Printf("SAFETY: shutting down everything this server started and halting tmux access.")
-	log.Printf("SAFETY: restart webtmux once you know why the rate climbed; raise --max-tmux-rate only if you are sure it is legitimate.")
+	slog.Error("tmux safety limit tripped", "reason", reason)
+	slog.Error("tmux access halted; shutting down processes started by webtmux")
+	slog.Error("restart webtmux after diagnosing the command rate; only raise max-tmux-rate for known legitimate traffic")
 
 	for _, fn := range registered {
 		go fn()

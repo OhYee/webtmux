@@ -9,11 +9,12 @@
 // printed, so a build log reads as well as an agent does.
 import { LitElement, html, css } from 'lit';
 
-const POLL_MS = 1500;
+const POLL_MS = 3000;
 // The first read stays small so the reader opens quickly; scrolling back asks
 // for more. The ceiling matches the server's own cap.
 const HISTORY_LINES = 500;
 const HISTORY_STEP = 1500;
+const DOM_CHUNK = 800;
 
 class WebtmuxReaderView extends LitElement {
   static properties = {
@@ -120,6 +121,8 @@ class WebtmuxReaderView extends LitElement {
     }
 
     .line {
+	  content-visibility: auto;
+	  contain-intrinsic-size: auto 1.45em;
       min-height: 1.55em;
     }
 
@@ -238,6 +241,7 @@ class WebtmuxReaderView extends LitElement {
     this.sending = false;
     this._atBottom = true;
     this._history = HISTORY_LINES;
+	this._renderStart = 0;
 
     window.addEventListener('webtmux-capture-update', (e) => {
       if (this.paneId && e.detail?.paneId !== this.paneId) return;
@@ -250,6 +254,13 @@ class WebtmuxReaderView extends LitElement {
       if (e.detail?.unchanged) return;
 
       this._atBottom = this.isAtBottom();
+	  const nextLines = e.detail?.lines || [];
+	  if (this._loading && this.capture) {
+		const rendered = Math.max(0, (this.capture.lines || []).length - this._renderStart);
+		this._renderStart = Math.max(0, nextLines.length - rendered - DOM_CHUNK);
+	  } else if (!this.capture || this._atBottom) {
+		this._renderStart = Math.max(0, nextLines.length - DOM_CHUNK);
+	  }
       this.capture = e.detail;
     });
   }
@@ -293,6 +304,14 @@ class WebtmuxReaderView extends LitElement {
     const out = e.target;
     this._atBottom = this.isAtBottom();
 
+	if (out.scrollTop <= 240 && this._renderStart > 0 && !this._expandingDom) {
+	  this._expandingDom = true;
+	  this._anchor = out.scrollHeight;
+	  this._renderStart = Math.max(0, this._renderStart - DOM_CHUNK);
+	  this.requestUpdate();
+	  return;
+	}
+
     if (out.scrollTop > 240 || this._loading || !this.hasMore()) return;
 
     this._loading = true;
@@ -312,6 +331,12 @@ class WebtmuxReaderView extends LitElement {
   updated() {
     const out = this.renderRoot.querySelector('.out');
     if (!out) return;
+	if (this._expandingDom) {
+	  if (this._anchor) out.scrollTop += out.scrollHeight - this._anchor;
+	  this._expandingDom = false;
+	  this._anchor = 0;
+	  return;
+	}
 
     // Older lines were just prepended: hold the reader where it was rather
     // than letting the new content shove the page around.
@@ -332,7 +357,8 @@ class WebtmuxReaderView extends LitElement {
   }
 
   render() {
-    const lines = this.capture?.lines || [];
+	const allLines = this.capture?.lines || [];
+	const lines = allLines.slice(this._renderStart);
 
     return html`
       <header>
@@ -371,6 +397,7 @@ class WebtmuxReaderView extends LitElement {
   // Tell the reader whether there is anything further back, so the top of the
   // list is not silently also the start of the output.
   historyMark() {
+	if (this._renderStart > 0) return html`<div class="mark">向上滚动显示前 ${this._renderStart} 行</div>`;
     if (this._loading) return html`<div class="mark">读取更早的输出…</div>`;
     if (this.hasMore()) return html`<div class="mark">向上滚动读取更早的输出</div>`;
 

@@ -84,11 +84,56 @@ webtmux -w tmux new-session -A -s main
 # ========================================
 ```
 
+For a one-command local setup, recreate a tmux session and window both named
+`webtmux`, run the server inside it, and make browser clients attach to that
+same session:
+
+```bash
+make start
+```
+
+The target builds the binary first and replaces an existing `webtmux` session.
+Pass additional server options with `WEBTMUX_FLAGS`, for example
+`make start WEBTMUX_FLAGS='-w -p 9090 --log-level debug --log-format json'`.
+Attach locally with `tmux attach-session -t webtmux` to see startup output and
+the generated password, or print the pane history without attaching:
+
+```bash
+make logs
+```
+
+The pane remains available after an abnormal exit, so `make logs` also shows
+startup failures. Run `make start` again after correcting the error.
+
 ### Custom Credentials
 
 ```bash
 webtmux -w -c user:password tmux new-session -A -s main
 ```
+
+### Environment File
+
+webtmux automatically reads `.env` from its working directory. Copy the
+included example and restrict its permissions before adding credentials:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Relevant settings include:
+
+```dotenv
+WEBTMUX_PORT=8080
+WEBTMUX_USERNAME=admin
+WEBTMUX_PASSWORD=change-me
+```
+
+Use `--env-file FILE` or `WEBTMUX_ENV_FILE` to select another file. Existing
+process environment variables override `.env`, and command-line options
+override both. Every generated option supports `WEBTMUX_<OPTION>` as well as
+the legacy `GOTTY_<OPTION>` name. A missing password keeps the secure default:
+webtmux generates a random password at startup.
 
 ### Disable Authentication (not recommended)
 
@@ -113,8 +158,39 @@ webtmux -w --no-auth tmux new-session -A -s main
 | `--reconnect` | Enable automatic reconnection |
 | `--once` | Accept only one client, then exit |
 | `--keys FILE` | Load the mobile key panel from a JSON file |
+| `--lang LANGUAGE` | Help language: `auto`, `en`, or `zh-CN` |
 
 Run `webtmux --help` for all available options.
+
+### Help Language
+
+Help is available in English and Simplified Chinese. webtmux detects Chinese
+locales automatically, or you can select a language explicitly:
+
+```bash
+webtmux --lang zh-CN --help
+WEBTMUX_LANG=en webtmux --help
+```
+
+An explicit `--lang` takes precedence over `WEBTMUX_LANG`; otherwise `LC_ALL`,
+`LC_MESSAGES`, and `LANG` are checked in that order.
+
+### Diagnostic Logging
+
+Logs are written to stderr. The default is human-readable `info` output; use
+debug logging while reproducing an intermittent problem, or JSON when logs are
+collected by a service manager:
+
+```bash
+webtmux --log-level debug --log-format text -w tmux attach -t main
+webtmux --log-format json -w tmux attach -t main
+```
+
+Diagnostic logs include startup configuration (without credentials), request
+and connection IDs, HTTP duration and status, child-process exit details, tmux
+transport fallback/recovery, command duration and bounded error output. They do
+not log authentication credentials, request headers, or successful tmux command
+output. `--quiet` disables all logs.
 
 ### Custom Mobile Keys
 

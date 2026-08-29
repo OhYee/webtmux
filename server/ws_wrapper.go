@@ -6,6 +6,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
+
+	"webtmux/webtty"
 )
 
 type wsWrapper struct {
@@ -16,7 +18,11 @@ func (wsw *wsWrapper) Write(p []byte) (n int, err error) {
 	if err := wsw.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return 0, err
 	}
-	writer, err := wsw.Conn.NextWriter(websocket.TextMessage)
+	messageType := websocket.TextMessage
+	if len(p) > 0 && p[0] == webtty.Output {
+		messageType = websocket.BinaryMessage
+	}
+	writer, err := wsw.Conn.NextWriter(messageType)
 	if err != nil {
 		return 0, err
 	}

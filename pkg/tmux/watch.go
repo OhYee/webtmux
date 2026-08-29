@@ -22,7 +22,9 @@ const recaptureAfter = 30 * time.Second
 
 // Viewers polling at about the same time share one build instead of repeating
 // the same metadata query and preview captures.
-const watchSnapshotTTL = time.Second
+const watchSnapshotTTL = 3 * time.Second
+
+const readerSnapshotTTL = 3 * time.Second
 
 // paneActivity caches board and reader captures between polls.
 type paneActivity struct {
@@ -56,44 +58,78 @@ type WatchTracker struct {
 
 	readerMu    sync.Mutex
 	readerCache map[string]cachedReader
+	readerCalls map[string]chan struct{}
 }
 
 type cachedReader struct {
 	capture *Capture
 	at      time.Time
+	paneID  string
 }
 
 func NewWatchTracker() *WatchTracker {
 	return &WatchTracker{
 		panes:       map[string]paneActivity{},
 		readerCache: map[string]cachedReader{},
+		readerCalls: map[string]chan struct{}{},
 	}
 }
 
-func (w *WatchTracker) captureSnapshot(key, known string, build func() (*Capture, error)) (*Capture, error) {
-	w.readerMu.Lock()
-	defer w.readerMu.Unlock()
-
-	if cached, ok := w.readerCache[key]; ok && time.Since(cached.at) < time.Second && cached.capture != nil {
-		copyOf := *cached.capture
-		if known != "" && known == copyOf.Digest {
-			copyOf.Lines = nil
-			copyOf.Unchanged = true
+func (w *WatchTracker) captureSnapshot(paneID, key, known string, build func() (*Capture, error)) (*Capture, error) {
+	for {
+		w.readerMu.Lock()
+		if cached, ok := w.readerCache[key]; ok && time.Since(cached.at) < readerSnapshotTTL && cached.capture != nil {
+			copyOf := *cached.capture
+			w.readerMu.Unlock()
+			if known != "" && known == copyOf.Digest {
+				copyOf.Lines = nil
+				copyOf.Unchanged = true
+			}
+			return &copyOf, nil
 		}
-		return &copyOf, nil
-	}
+		if call, ok := w.readerCalls[key]; ok {
+			w.readerMu.Unlock()
+			<-call
+			continue
+		}
+		call := make(chan struct{})
+		w.readerCalls[key] = call
+		w.readerMu.Unlock()
 
-	capture, err := build()
-	if err != nil {
-		return nil, err
+		capture, err := build()
+
+		w.readerMu.Lock()
+		delete(w.readerCalls, key)
+		if err == nil && !capture.Unchanged {
+			copyOf := *capture
+			w.readerCache[key] = cachedReader{capture: &copyOf, at: time.Now(), paneID: paneID}
+			w.pruneReaderCacheLocked()
+		}
+		close(call)
+		w.readerMu.Unlock()
+		return capture, err
 	}
-	// An unchanged response has no payload with which to satisfy a different
-	// viewer, so only cache complete captures.
-	if !capture.Unchanged {
-		copyOf := *capture
-		w.readerCache[key] = cachedReader{capture: &copyOf, at: time.Now()}
+}
+
+const maxReaderCacheEntries = 256
+
+func (w *WatchTracker) pruneReaderCacheLocked() {
+	cutoff := time.Now().Add(-30 * time.Second)
+	for key, cached := range w.readerCache {
+		if cached.at.Before(cutoff) {
+			delete(w.readerCache, key)
+		}
 	}
-	return capture, nil
+	for len(w.readerCache) > maxReaderCacheEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, cached := range w.readerCache {
+			if oldestKey == "" || cached.at.Before(oldest) {
+				oldestKey, oldest = key, cached.at
+			}
+		}
+		delete(w.readerCache, oldestKey)
+	}
 }
 
 // needsCapture reports whether a pane must be read again.
@@ -245,11 +281,23 @@ func (w *WatchTracker) rememberRead(paneID, digest string, activity time.Time) {
 // forget drops panes that no longer exist so the map cannot grow without bound.
 func (w *WatchTracker) forget(live map[string]bool) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	dead := make(map[string]bool)
 	for id := range w.panes {
 		if !live[id] {
 			delete(w.panes, id)
+			dead[id] = true
 		}
+	}
+	w.mu.Unlock()
+
+	if len(dead) > 0 {
+		w.readerMu.Lock()
+		for key, cached := range w.readerCache {
+			if dead[cached.paneID] {
+				delete(w.readerCache, key)
+			}
+		}
+		w.readerMu.Unlock()
 	}
 }
 

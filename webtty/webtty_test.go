@@ -3,10 +3,12 @@ package webtty
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"io"
 	"sync"
 	"testing"
+	"time"
+
+	"webtmux/pkg/tmux"
 )
 
 func TestInitialization(t *testing.T) {
@@ -74,14 +76,8 @@ func TestWriteFromSlaveCommand(t *testing.T) {
 		t.Fatalf("Unexpected message type `%c`", buf[0])
 	}
 
-	// Decode it and make sure it's intact
-	decoded := make([]byte, 1024)
-	n, err = base64.StdEncoding.Decode(decoded, buf[1:n])
-	if err != nil {
-		t.Fatalf("Unexpected error from Decode(): %s", err)
-	}
-	if !bytes.Equal(decoded[:n], message) {
-		t.Fatalf("Unexpected message received: `%s`", decoded[:n])
+	if !bytes.Equal(buf[1:n], message) {
+		t.Fatalf("Unexpected message received: `%s`", buf[1:n])
 	}
 
 	cancel()
@@ -111,6 +107,103 @@ func TestWriteFromFrontend(t *testing.T) {
 	if !bytes.Equal(readBuf[:n], message[1:]) {
 		t.Fatalf("Unexpected message received: `%s`", readBuf[:n])
 	}
+}
+
+func TestCtrlCFromFrontend(t *testing.T) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	mMaster, mSlave, _, cancel := prepareSUT(t, &wg, WithPermitWrite())
+	defer cancel()
+	checkNextMsgType(t, mMaster.gottyToMasterReader, SetWindowTitle)
+	checkNextMsgType(t, mMaster.gottyToMasterReader, SetBufferSize)
+
+	if _, err := mMaster.masterToGottyWriter.Write([]byte("4base64")); err != nil {
+		t.Fatal(err)
+	}
+	// The browser sends protocol type '1' followed by base64(0x03).
+	if _, err := mMaster.masterToGottyWriter.Write([]byte("1Aw==")); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 1)
+	if _, err := mSlave.gottyToSlaveReader.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	if buffer[0] != 0x03 {
+		t.Fatalf("PTY received %#x, want Ctrl+C (0x03)", buffer[0])
+	}
+}
+
+func TestSlowTmuxRequestDoesNotBlockTerminalInput(t *testing.T) {
+	mMaster, mSlave := newMockMaster(), newMockSlave()
+	wt, err := New(mMaster, mSlave, WithPermitWrite())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := &blockingTmuxController{watchStarted: make(chan struct{}), release: make(chan struct{})}
+	wt.SetTmuxController(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go wt.Run(ctx)
+	checkNextMsgType(t, mMaster.gottyToMasterReader, SetWindowTitle)
+	checkNextMsgType(t, mMaster.gottyToMasterReader, SetBufferSize)
+
+	if _, err := mMaster.masterToGottyWriter.Write([]byte{TmuxWatch}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctrl.watchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("tmux watch did not start")
+	}
+	if _, err := mMaster.masterToGottyWriter.Write([]byte{'1', 'x'}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan byte, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		_, _ = mSlave.gottyToSlaveReader.Read(buffer)
+		got <- buffer[0]
+	}()
+	select {
+	case value := <-got:
+		if value != 'x' {
+			t.Fatalf("PTY received %q", value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal input was blocked behind tmux watch")
+	}
+	close(ctrl.release)
+	checkNextMsgType(t, mMaster.gottyToMasterReader, TmuxWatchUpdate)
+}
+
+type blockingTmuxController struct {
+	watchStarted chan struct{}
+	release      chan struct{}
+}
+
+func (c *blockingTmuxController) GetLayout() *tmux.Layout     { return nil }
+func (c *blockingTmuxController) RefreshLayout() error        { return nil }
+func (c *blockingTmuxController) SelectPane(string) error     { return nil }
+func (c *blockingTmuxController) SelectWindow(string) error   { return nil }
+func (c *blockingTmuxController) SwitchSession(string) error  { return nil }
+func (c *blockingTmuxController) SplitPane(bool) error        { return nil }
+func (c *blockingTmuxController) ClosePane(string) error      { return nil }
+func (c *blockingTmuxController) ZoomPane(string, bool) error { return nil }
+func (c *blockingTmuxController) GotoPane(string) error       { return nil }
+func (c *blockingTmuxController) Capture(string, int, string) (*tmux.Capture, error) {
+	return &tmux.Capture{}, nil
+}
+func (c *blockingTmuxController) EnterCopyMode() error      { return nil }
+func (c *blockingTmuxController) ExitCopyMode() error       { return nil }
+func (c *blockingTmuxController) ScrollUp(int) error        { return nil }
+func (c *blockingTmuxController) ScrollDown(int) error      { return nil }
+func (c *blockingTmuxController) NewWindow() error          { return nil }
+func (c *blockingTmuxController) Events() <-chan tmux.Event { return nil }
+func (c *blockingTmuxController) Watch() (*tmux.Watch, error) {
+	close(c.watchStarted)
+	<-c.release
+	return &tmux.Watch{}, nil
 }
 
 func TestPing(t *testing.T) {

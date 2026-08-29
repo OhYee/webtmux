@@ -21,3 +21,6 @@ Thumbs.db
 
 # Frontend dependencies
 node_modules/
+
+# Local secrets
+.env

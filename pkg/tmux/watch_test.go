@@ -232,14 +232,14 @@ func TestLayoutSnapshotCollapsesConcurrentViewers(t *testing.T) {
 func TestReaderSnapshotReusesPayloadAcrossViewers(t *testing.T) {
 	w := NewWatchTracker()
 	builds := 0
-	first, err := w.captureSnapshot("%1:500", "", func() (*Capture, error) {
+	first, err := w.captureSnapshot("%1", "%1:500", "", func() (*Capture, error) {
 		builds++
 		return &Capture{PaneID: "%1", Digest: "same"}, nil
 	})
 	if err != nil || first.Digest != "same" {
 		t.Fatalf("first capture = %#v, %v", first, err)
 	}
-	second, err := w.captureSnapshot("%1:500", "same", func() (*Capture, error) {
+	second, err := w.captureSnapshot("%1", "%1:500", "same", func() (*Capture, error) {
 		builds++
 		return nil, fmt.Errorf("must not rebuild")
 	})
@@ -248,5 +248,45 @@ func TestReaderSnapshotReusesPayloadAcrossViewers(t *testing.T) {
 	}
 	if builds != 1 {
 		t.Fatalf("capture built %d times, want 1", builds)
+	}
+}
+
+func TestReaderSnapshotsForDifferentPanesDoNotShareOneLock(t *testing.T) {
+	w := NewWatchTracker()
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, paneID := range []string{"%1", "%2"} {
+		paneID := paneID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = w.captureSnapshot(paneID, paneID+":500", "", func() (*Capture, error) {
+				started <- paneID
+				<-release
+				return &Capture{PaneID: paneID, Digest: paneID}, nil
+			})
+		}()
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("different pane captures were serialized")
+		}
+	}
+	close(release)
+	wg.Wait()
+}
+
+func TestForgetRemovesReaderCacheForDeadPane(t *testing.T) {
+	w := NewWatchTracker()
+	w.panes["%1"] = paneActivity{}
+	w.readerCache["%1:500"] = cachedReader{
+		paneID: "%1", capture: &Capture{PaneID: "%1"}, at: time.Now(),
+	}
+	w.forget(map[string]bool{})
+	if len(w.readerCache) != 0 {
+		t.Fatalf("reader cache retained dead pane: %#v", w.readerCache)
 	}
 }

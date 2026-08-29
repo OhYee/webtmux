@@ -1,6 +1,8 @@
 package server
 
 import (
+	"strings"
+
 	"github.com/pkg/errors"
 )
 
@@ -39,6 +41,8 @@ type Options struct {
 	ReaderHistory       int    `hcl:"reader_history" flagName:"reader-history" flagDescribe:"How many lines of scrollback the reader may load for one pane. Higher costs transfer: roughly 90KB per 1000 lines, re-sent each time you scroll further back" default:"5000"`
 	Launchctl           bool   `hcl:"launchctl" default:"false"`
 	Quiet               bool   `hcl:"quiet" flagName:"quiet" flagDescribe:"Don't log" default:"false"`
+	LogLevel            string `hcl:"log_level" flagName:"log-level" flagDescribe:"Log level: error, warn, info, or debug" default:"info"`
+	LogFormat           string `hcl:"log_format" flagName:"log-format" flagDescribe:"Log format: text or json" default:"text"`
 
 	TitleVariables map[string]interface{}
 }
@@ -46,6 +50,18 @@ type Options struct {
 func (options *Options) Validate() error {
 	if options.EnableTLSClientAuth && !options.EnableTLS {
 		return errors.New("TLS client authentication is enabled, but TLS is not enabled")
+	}
+	options.LogLevel = strings.ToLower(options.LogLevel)
+	if options.LogLevel == "warning" {
+		options.LogLevel = "warn"
+	}
+	switch options.LogLevel {
+	case "error", "warn", "info", "debug":
+	default:
+		return errors.Errorf("invalid log level %q: use error, warn, info, or debug", options.LogLevel)
+	}
+	if options.LogFormat != "text" && options.LogFormat != "json" {
+		return errors.Errorf("invalid log format %q: use text or json", options.LogFormat)
 	}
 	return nil
 }

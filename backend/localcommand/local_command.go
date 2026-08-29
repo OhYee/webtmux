@@ -1,6 +1,7 @@
 package localcommand
 
 import (
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -27,6 +28,7 @@ type LocalCommand struct {
 	cmd       *exec.Cmd
 	pty       *os.File
 	ptyClosed chan struct{}
+	startedAt time.Time
 
 	resizeMu   sync.Mutex
 	lastWidth  int
@@ -66,6 +68,7 @@ func New(command string, argv []string, headers map[string][]string, options ...
 		cmd:       cmd,
 		pty:       pty,
 		ptyClosed: ptyClosed,
+		startedAt: time.Now(),
 	}
 
 	for _, option := range options {
@@ -80,7 +83,16 @@ func New(command string, argv []string, headers map[string][]string, options ...
 			close(lcmd.ptyClosed)
 		}()
 
-		lcmd.cmd.Wait()
+		err := lcmd.cmd.Wait()
+		attrs := []any{"command", lcmd.command, "pid", lcmd.cmd.Process.Pid, "duration", time.Since(lcmd.startedAt).Round(time.Millisecond)}
+		if lcmd.cmd.ProcessState != nil {
+			attrs = append(attrs, "exit_code", lcmd.cmd.ProcessState.ExitCode())
+		}
+		if err != nil {
+			slog.Warn("child process exited", append(attrs, "error", err)...)
+		} else {
+			slog.Info("child process exited", attrs...)
+		}
 	}()
 
 	return lcmd, nil
@@ -99,6 +111,7 @@ func (lcmd *LocalCommand) Close() error {
 		return nil
 	}
 	_ = lcmd.cmd.Process.Signal(lcmd.closeSignal)
+	slog.Debug("sent child close signal", "command", lcmd.command, "pid", lcmd.cmd.Process.Pid, "signal", lcmd.closeSignal)
 	timeout := lcmd.closeTimeoutC()
 	for {
 		select {
@@ -106,6 +119,7 @@ func (lcmd *LocalCommand) Close() error {
 			return nil
 		case <-timeout:
 			_ = lcmd.cmd.Process.Signal(syscall.SIGKILL)
+			slog.Warn("child close timed out; sent SIGKILL", "command", lcmd.command, "pid", lcmd.cmd.Process.Pid, "timeout", lcmd.closeTimeout)
 			timeout = make(chan time.Time)
 		}
 	}

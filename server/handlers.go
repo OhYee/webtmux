@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +24,8 @@ import (
 	"webtmux/webtty"
 )
 
+var connectionSequence atomic.Uint64
+
 func (server *Server) generateHandleWS(ctx context.Context, cancel context.CancelFunc, counter *counter) http.HandlerFunc {
 	once := new(int64)
 
@@ -35,6 +38,7 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 	}()
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		connectionID := fmt.Sprintf("c-%d", connectionSequence.Add(1))
 		if server.options.Once {
 			success := atomic.CompareAndSwapInt64(once, 0, 1)
 			if !success {
@@ -49,8 +53,8 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 		defer func() {
 			num := counter.done()
 			log.Printf(
-				"Connection closed by %s: %s, connections: %d/%d",
-				closeReason, r.RemoteAddr, num, server.options.MaxConnection,
+				"Connection closed id=%s reason=%s remote=%s connections=%d/%d",
+				connectionID, closeReason, r.RemoteAddr, num, server.options.MaxConnection,
 			)
 
 			if server.options.Once {
@@ -66,7 +70,7 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 			}
 		}
 
-		log.Printf("New client connected: %s, connections: %d/%d", r.RemoteAddr, num, server.options.MaxConnection)
+		slog.Info("client connected", "connection_id", connectionID, "remote", r.RemoteAddr, "connections", num, "max_connections", server.options.MaxConnection, "tmux_session", server.tmuxSession, "tmux_socket", server.tmuxSocket)
 
 		if r.Method != "GET" {
 			http.Error(w, "Method not allowed", 405)
@@ -82,12 +86,14 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 		conn.SetReadLimit(64 * 1024)
 
 		if server.options.PassHeaders {
-			err = server.processWSConn(ctx, conn, r.Header)
+			err = server.processWSConn(ctx, conn, r.Header, connectionID)
 		} else {
-			err = server.processWSConn(ctx, conn, nil)
+			err = server.processWSConn(ctx, conn, nil, connectionID)
 		}
 
 		switch err {
+		case nil:
+			closeReason = "normal completion"
 		case ctx.Err():
 			closeReason = "cancelation"
 		case webtty.ErrSlaveClosed:
@@ -100,7 +106,7 @@ func (server *Server) generateHandleWS(ctx context.Context, cancel context.Cance
 	}
 }
 
-func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, headers map[string][]string) error {
+func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, headers map[string][]string, connectionID string) error {
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
@@ -200,13 +206,13 @@ func (server *Server) processWSConn(ctx context.Context, conn *websocket.Conn, h
 			ctrl.UseRunner(server.tmuxExec)
 		}
 		if ctrlErr != nil {
-			log.Printf("Warning: failed to create tmux controller: %v", ctrlErr)
+			slog.Warn("failed to create tmux controller", "connection_id", connectionID, "session", server.tmuxSession, "socket", server.tmuxSocket, "error", ctrlErr)
 		} else if startErr := ctrl.Start(); startErr != nil {
 			// The controller already has a worker goroutine running, so a
 			// failed start still has to be torn down or every reconnect
 			// against an unreachable tmux leaks one.
 			ctrl.Stop()
-			log.Printf("Warning: failed to start tmux controller: %v", startErr)
+			slog.Warn("failed to start tmux controller", "connection_id", connectionID, "session", server.tmuxSession, "socket", server.tmuxSocket, "error", startErr)
 		} else {
 			// Pin session switching to the client this connection spawned.
 			if p, ok := slave.(interface{ Pid() int }); ok {
@@ -244,23 +250,27 @@ func (server *Server) handleTmuxEvents(ctx context.Context, tty *webtty.WebTTY, 
 	moved, unsubscribe := server.layoutDirty.subscribe()
 	defer unsubscribe()
 
-	// Notifications make a split show up at once; the sweep is what makes the
-	// result correct, because those notifications only cover one session.
-	// Over control mode the sweep costs a single command and no process.
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
 	var last uint64
+	var lastRefreshError time.Time
+	refreshFailing := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-moved:
-		case <-ticker.C:
 		}
 
 		if err := ctrl.RefreshLayout(); err != nil {
+			if !refreshFailing || time.Since(lastRefreshError) >= 30*time.Second {
+				slog.Warn("tmux layout refresh failed", "session", server.tmuxSession, "socket", server.tmuxSocket, "error", err)
+				lastRefreshError = time.Now()
+			}
+			refreshFailing = true
 			continue
+		}
+		if refreshFailing {
+			slog.Info("tmux layout refresh recovered", "session", server.tmuxSession, "socket", server.tmuxSocket)
+			refreshFailing = false
 		}
 		layout := ctrl.GetLayout()
 		if layout == nil {
@@ -278,7 +288,7 @@ func (server *Server) handleTmuxEvents(ctx context.Context, tty *webtty.WebTTY, 
 		if sum := h.Sum64(); sum != last {
 			last = sum
 			if err := tty.SendTmuxLayout(); err != nil {
-				log.Printf("Failed to send tmux layout: %v", err)
+				slog.Warn("failed to send tmux layout", "session", server.tmuxSession, "socket", server.tmuxSocket, "error", err)
 			}
 		}
 	}
@@ -287,6 +297,7 @@ func (server *Server) handleTmuxEvents(ctx context.Context, tty *webtty.WebTTY, 
 func (server *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	indexVars, err := server.indexVariables(r)
 	if err != nil {
+		slog.Error("failed to render index variables", "remote", r.RemoteAddr, "path", r.URL.Path, "error", err)
 		http.Error(w, "Internal Server Error", 500)
 		return
 	}
@@ -294,6 +305,7 @@ func (server *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	indexBuf := new(bytes.Buffer)
 	err = server.indexTemplate.Execute(indexBuf, indexVars)
 	if err != nil {
+		slog.Error("failed to render index template", "remote", r.RemoteAddr, "path", r.URL.Path, "error", err)
 		http.Error(w, "Internal Server Error", 500)
 		return
 	}
@@ -304,6 +316,7 @@ func (server *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (server *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	indexVars, err := server.indexVariables(r)
 	if err != nil {
+		slog.Error("failed to render manifest variables", "remote", r.RemoteAddr, "path", r.URL.Path, "error", err)
 		http.Error(w, "Internal Server Error", 500)
 		return
 	}
@@ -311,6 +324,7 @@ func (server *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	indexBuf := new(bytes.Buffer)
 	err = server.manifestTemplate.Execute(indexBuf, indexVars)
 	if err != nil {
+		slog.Error("failed to render manifest template", "remote", r.RemoteAddr, "path", r.URL.Path, "error", err)
 		http.Error(w, "Internal Server Error", 500)
 		return
 	}
@@ -343,8 +357,13 @@ func (server *Server) indexVariables(r *http.Request) (map[string]interface{}, e
 
 func (server *Server) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript")
-	// @TODO hashing?
-	w.Write([]byte("var gotty_auth_token = '" + server.options.Credential + "';"))
+	credential, err := json.Marshal(server.options.Credential)
+	if err != nil {
+		slog.Error("failed to encode authentication token", "remote", r.RemoteAddr, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(append(append([]byte("var gotty_auth_token = "), credential...), ';'))
 }
 
 func (server *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -363,13 +382,13 @@ func (server *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 func (server *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	panel, err := keys.Load(server.options.KeysFile)
 	if err != nil {
-		log.Printf("key panel: %v; falling back to the built-in panel", err)
+		slog.Warn("failed to load key panel; using built-in panel", "file", server.options.KeysFile, "error", err)
 		panel = keys.Default()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(panel); err != nil {
-		log.Printf("failed to write key panel: %v", err)
+		slog.Warn("failed to write key panel response", "remote", r.RemoteAddr, "error", err)
 	}
 }
 

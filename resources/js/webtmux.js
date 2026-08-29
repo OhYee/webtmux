@@ -67,6 +67,9 @@ class WebTmux {
     this.heartbeat = 0;
     this.viewDepth = 0;
     this.oscBuffer = ''; // Buffer for OSC sequence detection
+    this.outputQueue = [];
+    this.outputQueueBytes = 0;
+    this.outputWriting = false;
     this.mods = { ctrl: false, alt: false, shift: false }; // armed by the key panel
 
     this.init();
@@ -145,8 +148,10 @@ class WebTmux {
       // Only handle keydown events
       if (ev.type !== 'keydown') return true;
 
-      // Allow Cmd+C / Ctrl+C to copy selected text
-      if ((ev.metaKey || ev.ctrlKey) && ev.key === 'c') {
+      // Copy selected text, but make physical Ctrl+C deterministic when there
+      // is no selection. Relying on the browser/xterm default here differs
+      // between platforms and can swallow the interrupt entirely.
+      if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'c') {
         const selection = this.terminal.getSelection();
         if (selection) {
           navigator.clipboard.writeText(selection).catch(err => {
@@ -154,7 +159,11 @@ class WebTmux {
           });
           return false; // Handled
         }
-        // No selection - let it pass through as Ctrl+C (interrupt)
+        if (ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          this.sendMessage(MSG.Input, btoa('\x03'));
+          return false;
+        }
+        // Cmd+C without a selection remains a normal browser shortcut.
         return true;
       }
 
@@ -183,8 +192,14 @@ class WebTmux {
       };
 
       if (arrowMap[ev.key]) {
-        // Send raw CSI sequence
-        const seq = arrowMap[ev.key];
+        // Preserve physical modifiers. The old handler always sent an
+        // unmodified arrow, so Ctrl/Alt/Shift+Arrow silently behaved like the
+        // plain key even though the soft-key path encoded it correctly.
+        const seq = this.applyModifiersToSequence(arrowMap[ev.key], {
+          ctrl: ev.ctrlKey,
+          alt: ev.altKey || ev.metaKey,
+          shift: ev.shiftKey,
+        });
         const binary = String.fromCharCode(...[...seq].map(c => c.charCodeAt(0)));
         this.sendMessage(MSG.Input, btoa(binary));
         return false; // Prevent xterm.js default handling
@@ -367,6 +382,7 @@ class WebTmux {
 
     clearTimeout(this.reconnectTimer);
     const ws = new WebSocket(wsUrl, ['webtty']);
+    ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
     ws.onopen = () => {
@@ -409,6 +425,8 @@ class WebTmux {
       console.log('WebSocket closed');
       clearInterval(this.heartbeat);
       this.heartbeat = 0;
+	  this.outputQueue = [];
+	  this.outputQueueBytes = 0;
       if (Date.now() - this.connectedAt >= 30000) this.retryDelay = 0;
 
       // Check if there are other sessions to switch to
@@ -441,6 +459,13 @@ class WebTmux {
   }
 
   handleMessage(data) {
+    if (data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(data);
+      if (bytes[0] === MSG.Output.charCodeAt(0)) {
+        this.enqueueOutput(this.processOSC52Bytes(bytes.subarray(1)));
+      }
+      return;
+    }
     const type = data[0];
     const payload = data.slice(1);
 
@@ -456,7 +481,7 @@ class WebTmux {
         for (let i = 0; i < processed.length; i++) {
           bytes[i] = processed.charCodeAt(i);
         }
-        this.terminal.write(bytes);
+        this.enqueueOutput(bytes);
         break;
 
       case MSG.Pong:
@@ -521,6 +546,53 @@ class WebTmux {
     } else {
       console.warn('WebSocket not ready, state:', this.ws?.readyState);
     }
+  }
+
+  enqueueOutput(bytes) {
+    if (!bytes.length) return;
+    const MAX_QUEUED_OUTPUT = 16 * 1024 * 1024;
+    if (this.outputQueueBytes + bytes.byteLength > MAX_QUEUED_OUTPUT) {
+      console.error('Terminal output exceeded the client queue limit; reconnecting');
+      this.ws?.close(1013, 'terminal output backlog');
+      return;
+    }
+    this.outputQueue.push(bytes);
+    this.outputQueueBytes += bytes.byteLength;
+    this.drainOutput();
+  }
+
+  drainOutput() {
+    if (this.outputWriting || this.outputQueue.length === 0) return;
+    const bytes = this.outputQueue.shift();
+    this.outputQueueBytes -= bytes.byteLength;
+    this.outputWriting = true;
+    this.terminal.write(bytes, () => {
+      this.outputWriting = false;
+      this.drainOutput();
+    });
+  }
+
+  processOSC52Bytes(bytes) {
+    // Most terminal traffic contains ANSI ESC bytes but not OSC 52. Scan for
+    // the exact prefix and keep the common path zero-copy.
+    let found = false;
+    for (let i = 0; i + 4 < bytes.length; i++) {
+      if (bytes[i] === 0x1b && bytes[i + 1] === 0x5d && bytes[i + 2] === 0x35 &&
+          bytes[i + 3] === 0x32 && bytes[i + 4] === 0x3b) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) return bytes;
+
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    }
+    const processed = this.handleOSC52(binary);
+    const result = new Uint8Array(processed.length);
+    for (let i = 0; i < processed.length; i++) result[i] = processed.charCodeAt(i);
+    return result;
   }
 
   // True only when the terminal actually occupies space. On a phone the board
@@ -612,10 +684,15 @@ class WebTmux {
   // byte, so Ctrl+Left is "\x1b[1;5D" and not an escaped anything. Sequences
   // with no such form are sent unchanged rather than mangled.
   applyArmedModsToSequence(seq) {
-    const { ctrl, alt, shift } = this.mods;
+    const result = this.applyModifiersToSequence(seq, this.mods);
+    this.clearMods();
+    return result;
+  }
+
+  applyModifiersToSequence(seq, mods) {
+    const { ctrl, alt, shift } = mods;
     // CSI modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
     const param = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0);
-    this.clearMods();
     if (param === 1) return seq;
 
     // Arrows and Home/End: ESC [ <letter>  ->  ESC [ 1 ; <param> <letter>

@@ -3,7 +3,7 @@
 // It is an index of the real server, with a small output preview for each pane.
 import { LitElement, html, css } from 'lit';
 
-const POLL_MS = 2000;
+const POLL_MS = 5000;
 
 class WebtmuxWatchBoard extends LitElement {
   static properties = {
